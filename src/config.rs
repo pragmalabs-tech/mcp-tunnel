@@ -22,13 +22,14 @@ pub fn load_from_env() -> RelayConfig {
         std::process::exit(1);
     });
 
-    let auth_mode = std::env::var("MCPR_RELAY_AUTH_MODE")
-        .unwrap_or_else(|_| "open".to_string());
+    let auth_mode = std::env::var("MCPR_RELAY_AUTH_MODE").unwrap_or_else(|_| "open".to_string());
 
     let (auth_provider, auth_provider_secret) = match auth_mode.as_str() {
         "provider" => {
             let url = std::env::var("MCPR_RELAY_AUTH_URL").unwrap_or_else(|_| {
-                eprintln!("error: MCPR_RELAY_AUTH_URL is required when MCPR_RELAY_AUTH_MODE=provider");
+                eprintln!(
+                    "error: MCPR_RELAY_AUTH_URL is required when MCPR_RELAY_AUTH_MODE=provider"
+                );
                 std::process::exit(1);
             });
             let secret = std::env::var("MCPR_RELAY_AUTH_SECRET").unwrap_or_else(|_| {
@@ -83,12 +84,13 @@ fn parse_tokens_env() -> HashMap<String, Vec<String>> {
     };
 
     match serde_json::from_str::<Vec<TokenEntry>>(&raw) {
-        Ok(entries) => entries.into_iter().map(|e| (e.token, e.subdomains)).collect(),
+        Ok(entries) => entries
+            .into_iter()
+            .map(|e| (e.token, e.subdomains))
+            .collect(),
         Err(e) => {
             eprintln!("error: failed to parse MCPR_RELAY_TOKENS: {e}");
-            eprintln!(
-                r#"  expected: [{{"token":"tok_abc","subdomains":["myapp","myapp-*"]}}]"#
-            );
+            eprintln!(r#"  expected: [{{"token":"tok_abc","subdomains":["myapp","myapp-*"]}}]"#);
             std::process::exit(1);
         }
     }

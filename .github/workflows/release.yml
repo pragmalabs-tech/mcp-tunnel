@@ -4,8 +4,6 @@ on:
   push:
     tags:
       - "v*"
-    branches:
-      - main
 
 env:
   REGISTRY: ghcr.io
@@ -38,13 +36,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            # :vX.Y.Z and :latest on version tags
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            # :main on push to main branch
-            type=ref,event=branch
-            # :sha-<short> on every push
-            type=sha,prefix=sha-,format=short
 
       - name: Build and push
         uses: docker/build-push-action@v6

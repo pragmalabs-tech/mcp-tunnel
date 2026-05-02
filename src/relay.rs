@@ -66,7 +66,10 @@ pub fn build_relay_app(cfg: RelayConfig) -> (Router, u16) {
         let secret = cfg
             .auth_provider_secret
             .expect("auth_provider_secret is required when auth_provider is set");
-        println!("  {} auth provider: {url}", colored::Colorize::green("ready"));
+        println!(
+            "  {} auth provider: {url}",
+            colored::Colorize::green("ready")
+        );
         AuthMode::Provider(AuthProviderConfig {
             url: url.trim_end_matches('/').to_string(),
             secret,
@@ -84,7 +87,9 @@ pub fn build_relay_app(cfg: RelayConfig) -> (Router, u16) {
     };
 
     const DEFAULT_MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024;
-    let max_response_body = cfg.max_response_body_size.unwrap_or(DEFAULT_MAX_RESPONSE_BODY);
+    let max_response_body = cfg
+        .max_response_body_size
+        .unwrap_or(DEFAULT_MAX_RESPONSE_BODY);
 
     let state = Arc::new(RelayState {
         tunnels: DashMap::new(),
@@ -94,7 +99,9 @@ pub fn build_relay_app(cfg: RelayConfig) -> (Router, u16) {
     });
 
     const DEFAULT_MAX_REQUEST_BODY: usize = 5 * 1024 * 1024;
-    let max_body = cfg.max_request_body_size.unwrap_or(DEFAULT_MAX_REQUEST_BODY);
+    let max_body = cfg
+        .max_request_body_size
+        .unwrap_or(DEFAULT_MAX_REQUEST_BODY);
 
     let app = Router::new()
         .route("/_tunnel/register", any(handle_register))
@@ -143,7 +150,9 @@ async fn handle_tunnel_ws(socket: WebSocket, state: Arc<RelayState>) {
         ws_stream: &mut futures_util::stream::SplitStream<WebSocket>,
         allowed: &[String],
     ) -> Option<String> {
-        let offer = SubdomainOffer { subdomains: allowed.to_vec() };
+        let offer = SubdomainOffer {
+            subdomains: allowed.to_vec(),
+        };
         if ws_sink
             .send(Message::Text(serde_json::to_string(&offer).unwrap().into()))
             .await
@@ -213,7 +222,10 @@ async fn handle_tunnel_ws(socket: WebSocket, state: Arc<RelayState>) {
                     return;
                 }
                 Err(AuthError::ProviderUnavailable(msg)) => {
-                    eprintln!("  {} auth provider error: {msg}", colored::Colorize::red("error"));
+                    eprintln!(
+                        "  {} auth provider error: {msg}",
+                        colored::Colorize::red("error")
+                    );
                     close_with_error(&mut ws_sink, "auth provider unavailable").await;
                     return;
                 }
@@ -228,7 +240,10 @@ async fn handle_tunnel_ws(socket: WebSocket, state: Arc<RelayState>) {
 
     let url = format!("https://{}.{}", subdomain, state.base_domain);
 
-    let ack = RegisterAck { subdomain: subdomain.clone(), url: url.clone() };
+    let ack = RegisterAck {
+        subdomain: subdomain.clone(),
+        url: url.clone(),
+    };
     if ws_sink
         .send(Message::Text(serde_json::to_string(&ack).unwrap().into()))
         .await
@@ -247,12 +262,19 @@ async fn handle_tunnel_ws(socket: WebSocket, state: Arc<RelayState>) {
 
     if let Some((_, old)) = state.tunnels.remove(&subdomain) {
         old.evict.notify_one();
-        println!("  {} evicted old tunnel: {subdomain}", colored::Colorize::yellow("warn"));
+        println!(
+            "  {} evicted old tunnel: {subdomain}",
+            colored::Colorize::yellow("warn")
+        );
     }
 
     let conn_for_evict = conn.clone();
     state.tunnels.insert(subdomain.clone(), conn);
-    println!("  {} tunnel registered: {}", colored::Colorize::green("ready"), colored::Colorize::cyan(url.as_str()));
+    println!(
+        "  {} tunnel registered: {}",
+        colored::Colorize::green("ready"),
+        colored::Colorize::cyan(url.as_str())
+    );
 
     let send_task = tokio::spawn(async move {
         loop {
@@ -293,7 +315,10 @@ async fn handle_tunnel_ws(socket: WebSocket, state: Arc<RelayState>) {
 
     send_task.abort();
     state.tunnels.remove(&subdomain);
-    println!("  {} tunnel disconnected: {subdomain}", colored::Colorize::red("error"));
+    println!(
+        "  {} tunnel disconnected: {subdomain}",
+        colored::Colorize::red("error")
+    );
 }
 
 async fn handle_tunnel_request(
@@ -303,19 +328,39 @@ async fn handle_tunnel_request(
     uri: axum::http::Uri,
     body: Bytes,
 ) -> Response {
-    let host = headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let subdomain = host.split('.').next().unwrap_or("").to_string();
-    let path_str = uri.path_and_query().map(|p| p.to_string()).unwrap_or_else(|| "/".into());
+    let path_str = uri
+        .path_and_query()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "/".into());
 
     if subdomain.is_empty() {
-        relay_log("-", method.as_str(), &path_str, 400, 0, std::time::Duration::ZERO);
+        relay_log(
+            "-",
+            method.as_str(),
+            &path_str,
+            400,
+            0,
+            std::time::Duration::ZERO,
+        );
         return (StatusCode::BAD_REQUEST, "missing host header").into_response();
     }
 
     let conn = match state.tunnels.get(&subdomain) {
         Some(c) => c.clone(),
         None => {
-            relay_log(&subdomain, method.as_str(), &path_str, 502, 0, std::time::Duration::ZERO);
+            relay_log(
+                &subdomain,
+                method.as_str(),
+                &path_str,
+                502,
+                0,
+                std::time::Duration::ZERO,
+            );
             return (StatusCode::BAD_GATEWAY, "tunnel not found").into_response();
         }
     };
@@ -323,7 +368,9 @@ async fn handle_tunnel_request(
     let req_id = uuid::Uuid::new_v4().to_string();
     let mut req_headers = HashMap::new();
     for (key, val) in headers.iter() {
-        if is_hop_by_hop(key.as_str()) { continue; }
+        if is_hop_by_hop(key.as_str()) {
+            continue;
+        }
         if let Ok(v) = val.to_str() {
             req_headers.insert(key.to_string(), v.to_string());
         }
@@ -338,41 +385,62 @@ async fn handle_tunnel_request(
     let tunnel_req = TunnelRequest {
         id: req_id.clone(),
         method: method.to_string(),
-        path: uri.path_and_query().map(|p| p.to_string()).unwrap_or_else(|| "/".into()),
+        path: path_str.clone(),
         headers: req_headers,
         body: body_b64,
     };
 
     let (resp_tx, resp_rx) = oneshot::channel();
-    conn.pending.write().await.insert(req_id.clone(), resp_tx);
-
     let msg = serde_json::to_string(&tunnel_req).unwrap();
     match conn.sender.try_send(msg) {
-        Ok(()) => {}
+        Ok(()) => {
+            conn.pending.write().await.insert(req_id.clone(), resp_tx);
+        }
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-            conn.pending.write().await.remove(&req_id);
-            relay_log(&subdomain, method.as_str(), &path_str, 503, 0, std::time::Duration::ZERO);
+            relay_log(
+                &subdomain,
+                method.as_str(),
+                &path_str,
+                503,
+                0,
+                std::time::Duration::ZERO,
+            );
             return (StatusCode::SERVICE_UNAVAILABLE, "tunnel overloaded").into_response();
         }
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-            conn.pending.write().await.remove(&req_id);
-            relay_log(&subdomain, method.as_str(), &path_str, 502, 0, std::time::Duration::ZERO);
+            relay_log(
+                &subdomain,
+                method.as_str(),
+                &path_str,
+                502,
+                0,
+                std::time::Duration::ZERO,
+            );
             return (StatusCode::BAD_GATEWAY, "tunnel disconnected").into_response();
         }
     }
 
-    let path = uri.path_and_query().map(|p| p.to_string()).unwrap_or_else(|| "/".into());
+    let path = path_str;
     let start = std::time::Instant::now();
 
     match tokio::time::timeout(std::time::Duration::from_secs(30), resp_rx).await {
         Ok(Ok(resp)) => {
             let status_code = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
             let body_len = resp.body.as_ref().map(|b| b.len()).unwrap_or(0);
-            relay_log(&subdomain, method.as_ref(), &path, resp.status, body_len, start.elapsed());
+            relay_log(
+                &subdomain,
+                method.as_ref(),
+                &path,
+                resp.status,
+                body_len,
+                start.elapsed(),
+            );
 
             let mut builder = Response::builder().status(status_code);
             for (k, v) in &resp.headers {
-                if is_hop_by_hop(k) { continue; }
+                if is_hop_by_hop(k) {
+                    continue;
+                }
                 if let (Ok(name), Ok(val)) = (
                     HeaderName::from_bytes(k.as_bytes()),
                     HeaderValue::from_str(v),
@@ -410,7 +478,14 @@ async fn handle_tunnel_request(
     }
 }
 
-fn relay_log(subdomain: &str, method: &str, path: &str, status: u16, body_len: usize, duration: std::time::Duration) {
+fn relay_log(
+    subdomain: &str,
+    method: &str,
+    path: &str,
+    status: u16,
+    body_len: usize,
+    duration: std::time::Duration,
+) {
     use colored::Colorize;
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
     let status_str = if status < 300 {
