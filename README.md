@@ -165,12 +165,59 @@ The wildcard TLS certificate covers `*.tunnel.example.com`. Let's Encrypt suppor
 
 To connect a service from Rust, use [`mcp-tunnel-client`](crates/mcp-tunnel-client) — published to crates.io.
 
-```toml
-[dependencies]
-mcp-tunnel-client = "0.1"
+### Install
+
+```sh
+cargo new --bin mytunnel
+cd mytunnel
+cargo add mcp-tunnel-client
+cargo add tokio --features macros,rt-multi-thread,signal
+cargo add axum                                 # or whatever HTTP framework you use
 ```
 
-See [crates/mcp-tunnel-client/README.md](crates/mcp-tunnel-client/README.md) for the full API.
+### Use
+
+`src/main.rs`:
+
+```rust
+use axum::{Router, routing::get};
+use mcp_tunnel_client::{TunnelStatusCallback, start_tunnel_client};
+
+struct Logger;
+impl TunnelStatusCallback for Logger {
+    fn on_connected(&self, url: &str) { println!("public URL: {url}"); }
+    fn on_disconnected(&self) { println!("disconnected"); }
+    fn on_evicted(&self) { println!("evicted"); }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. start your local HTTP service
+    let app = Router::new().route("/", get(|| async { "hello" }));
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 9000)).await?;
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+
+    // 2. expose it through the relay
+    let public_url = start_tunnel_client(
+        9000,                              // local port your service listens on
+        "https://tunnel.example.com",      // relay URL
+        "tok_abc",                         // auth token (use "any" in open mode)
+        Some("myapp"),                     // requested subdomain (None lets the relay pick)
+        Logger,
+    ).await?;
+    println!("reachable at {public_url}");
+
+    // 3. keep the process alive; the tunnel runs in a background task
+    tokio::signal::ctrl_c().await?;
+    Ok(())
+}
+```
+
+```sh
+cargo run
+```
+
+See [`examples/basic`](examples/basic) for a runnable end-to-end demo and [crates/mcp-tunnel-client/README.md](crates/mcp-tunnel-client/README.md) for the full API.
 
 ## Build from source
 
