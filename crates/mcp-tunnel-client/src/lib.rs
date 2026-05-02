@@ -1,4 +1,4 @@
-//! Client library for connecting a local HTTP/MCP server to an [`mcp-tunnel`](https://github.com/pragmalabs-tech/mcp-tunnel) relay.
+//! Client library for connecting a local HTTP service to an [`mcp-tunnel`](https://github.com/pragmalabs-tech/mcp-tunnel) relay.
 //!
 //! ```no_run
 //! use mcp_tunnel_client::{TunnelStatusCallback, start_tunnel_client};

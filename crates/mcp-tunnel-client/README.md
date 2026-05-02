@@ -1,6 +1,6 @@
 # mcp-tunnel-client
 
-Rust client for [mcp-tunnel](https://github.com/pragmalabs-tech/mcp-tunnel). Embed in your MCP server to expose it through a hosted tunnel relay without running a separate `mcpr proxy`.
+Rust client for [mcp-tunnel](https://github.com/pragmalabs-tech/mcp-tunnel). Embed it in any HTTP service to expose it through a self-hosted tunnel relay - no separate process needed.
 
 ```toml
 [dependencies]
@@ -21,7 +21,7 @@ impl TunnelStatusCallback for Logger {
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
-    // your MCP server is already running on localhost:9000
+    // your HTTP service is already running on localhost:9000
 
     let public_url = start_tunnel_client(
         9000,                              // local port

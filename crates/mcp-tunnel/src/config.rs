@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(version, about = "Self-hosted relay server for mcpr tunneling")]
+#[command(version, about = "Self-hosted HTTP tunnel relay server")]
 pub struct Cli {
     /// Base domain for tunnel subdomains (e.g. tunnel.example.com)
     #[arg(long)]

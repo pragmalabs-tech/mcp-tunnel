@@ -1,36 +1,53 @@
 # mcp-tunnel
 
-Relay server for [mcpr](https://github.com/pragmalabs-tech/mcpr) tunnels. Accepts WebSocket connections from `mcpr proxy run` instances and routes inbound HTTP traffic to them by subdomain.
+Self-hosted HTTP tunnel relay. Run it on a host with a wildcard DNS record, point a client at it from anywhere, and inbound traffic to `{subdomain}.{your-domain}` gets forwarded through a WebSocket to a service running on the client's `localhost`.
 
 ```
-Internet -> mcp-tunnel (this) -> WebSocket -> mcpr proxy -> MCP server
-              tunnel.example.com/myapp                      localhost:3004
+Internet -> mcp-tunnel relay -> WebSocket -> mcp-tunnel-client -> local HTTP service
+            tunnel.example.com                                     localhost:9000
 ```
+
+Useful for exposing a local dev server, MCP server, webhook receiver, or any HTTP service to the internet without poking holes in firewalls.
 
 ## Quick start
+
+Run the relay:
 
 ```sh
 docker run -p 8080:8080 ghcr.io/pragmalabs-tech/mcp-tunnel \
   --domain tunnel.example.com
 ```
 
-On the client side, set `[tunnel]` in your `mcpr.toml`:
+Connect a client (Rust):
 
 ```toml
-[tunnel]
-enabled   = true
-relay_url = "https://tunnel.example.com"
-token     = "tok_abc"
+# Cargo.toml
+[dependencies]
+mcp-tunnel-client = "0.1"
 ```
 
-Then run `mcpr proxy run mcpr.toml`. The proxy connects to the relay and prints the public URL:
+```rust
+use mcp_tunnel_client::{TunnelStatusCallback, start_tunnel_client};
 
-```
-  ready  mcpr proxy running on http://localhost:3004 -> http://localhost:9000
-  tunnel public URL: https://myapp.tunnel.example.com
+struct Logger;
+impl TunnelStatusCallback for Logger {
+    fn on_connected(&self, url: &str) { println!("public URL: {url}"); }
+    fn on_disconnected(&self) {}
+    fn on_evicted(&self) {}
+}
+
+let public_url = start_tunnel_client(
+    9000,                              // your local port
+    "https://tunnel.example.com",      // relay URL
+    "tok_abc",                         // auth token
+    Some("myapp"),                     // requested subdomain
+    Logger,
+).await?;
 ```
 
-## CLI flags
+See [`examples/basic`](examples/basic) for a runnable end-to-end demo.
+
+## Relay CLI flags
 
 ```
 mcp-tunnel --domain <DOMAIN> [OPTIONS]
@@ -80,11 +97,11 @@ Subdomain patterns support a single `*` wildcard:
 
 ### Provider
 
-Delegates token verification to an external HTTP endpoint. Used with [mcpr cloud](https://mcpr.app) or a custom auth service.
+Delegates token verification to an external HTTP endpoint (run your own auth service).
 
 ```sh
 mcp-tunnel --domain tunnel.example.com \
-  --auth-url https://api.mcpr.app \
+  --auth-url https://auth.example.com \
   --auth-secret <shared-secret>
 ```
 
@@ -115,7 +132,7 @@ services:
       - "8080:8080"
     command:
       - --domain=tunnel.example.com
-      - --auth-url=https://api.mcpr.app
+      - --auth-url=https://auth.example.com
       - --auth-secret=${RELAY_SECRET}
 ```
 
@@ -146,17 +163,11 @@ The wildcard TLS certificate covers `*.tunnel.example.com`. Let's Encrypt suppor
 
 ## Client library
 
-To embed the tunnel client directly into your own MCP server (no separate `mcpr proxy run` process needed), use the [`mcp-tunnel-client`](crates/mcp-tunnel-client) crate published to crates.io:
+To connect a service from Rust, use [`mcp-tunnel-client`](crates/mcp-tunnel-client) — published to crates.io.
 
 ```toml
 [dependencies]
 mcp-tunnel-client = "0.1"
-```
-
-```rust
-use mcp_tunnel_client::start_tunnel_client;
-
-let public_url = start_tunnel_client(9000, "https://tunnel.example.com", "tok_abc", Some("myapp"), MyStatus).await?;
 ```
 
 See [crates/mcp-tunnel-client/README.md](crates/mcp-tunnel-client/README.md) for the full API.
@@ -187,10 +198,10 @@ This bumps both crates to the same version, publishes `mcp-tunnel-client` to cra
 
 ## How it works
 
-1. `mcpr proxy run` opens a WebSocket to `/_tunnel/register` and sends a registration message with its auth token.
-2. The relay authenticates the token, assigns a subdomain, and acknowledges with the public URL.
-3. Inbound HTTP requests arrive at `{subdomain}.{domain}`. The relay extracts the subdomain from the `Host` header, finds the matching WebSocket connection, and forwards the request as a JSON message.
-4. The proxy receives the request, forwards it to the local MCP server, and sends the response back through the WebSocket.
+1. The client opens a WebSocket to `/_tunnel/register` and sends a registration message with its auth token and (optional) requested subdomain.
+2. The relay verifies the token, assigns a subdomain, and acknowledges with the public URL.
+3. Inbound HTTP requests arrive at `{subdomain}.{domain}`. The relay extracts the subdomain from the `Host` header, finds the matching WebSocket connection, and forwards the request as a JSON message (base64 body).
+4. The client receives the request, forwards it to the local service, and sends the response back through the WebSocket.
 5. If a second client registers the same subdomain, the relay evicts the previous connection (close code 4002).
 
 ## License

@@ -1,6 +1,6 @@
 # basic
 
-Expose a local axum server through an mcp-tunnel relay using `mcp-tunnel-client`.
+Expose a local axum server through a self-hosted tunnel relay using `mcp-tunnel-client`.
 
 ## 1. Run the relay (Docker)
 

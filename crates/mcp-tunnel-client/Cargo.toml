@@ -1,6 +1,6 @@
 [package]
 name = "mcp-tunnel-client"
-description = "Client library to connect a local HTTP/MCP server to an mcp-tunnel relay"
+description = "Client library to connect a local HTTP service to an mcp-tunnel relay"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

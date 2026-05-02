@@ -1,6 +1,6 @@
 [package]
 name = "mcp-tunnel"
-description = "Self-hosted relay server for mcpr tunneling"
+description = "Self-hosted HTTP tunnel relay server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
