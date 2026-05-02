@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/mcp-tunnel", "crates/mcp-tunnel-client"]
+exclude = ["examples/basic"]
 
 [workspace.package]
 version = "0.1.0"
