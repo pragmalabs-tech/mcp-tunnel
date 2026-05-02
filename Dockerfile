@@ -1,21 +1,21 @@
 # syntax=docker/dockerfile:1.7
 # Multi-stage build: cargo-chef for dependency caching, alpine runtime.
 
-FROM rust:1.87-alpine AS planner
+FROM rust:1.92-alpine AS planner
 RUN apk add --no-cache musl-dev
 RUN cargo install cargo-chef
 WORKDIR /app
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
-FROM rust:1.87-alpine AS cacher
+FROM rust:1.92-alpine AS cacher
 RUN apk add --no-cache musl-dev
 RUN cargo install cargo-chef
 WORKDIR /app
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 
-FROM rust:1.87-alpine AS builder
+FROM rust:1.92-alpine AS builder
 RUN apk add --no-cache musl-dev
 WORKDIR /app
 COPY . .

@@ -145,7 +145,7 @@ The wildcard TLS certificate covers `*.tunnel.example.com`. Let's Encrypt suppor
 
 ## Build from source
 
-Requires Rust 1.87+.
+Requires Rust 1.92+.
 
 ```sh
 cargo build --release
