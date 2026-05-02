@@ -1,0 +1,429 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::DefaultBodyLimit;
+use axum::extract::ws::{Message, WebSocket};
+use axum::extract::{State, WebSocketUpgrade};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::any;
+use base64::Engine;
+use dashmap::DashMap;
+use futures_util::{SinkExt, StreamExt};
+use sha2::{Digest, Sha256};
+use tokio::sync::{RwLock, oneshot};
+
+use crate::auth::{AuthError, AuthProviderConfig, subdomain_matches, verify_token};
+use crate::config::RelayConfig;
+use crate::protocol::{
+    RegisterAck, RegisterRequest, SubdomainOffer, SubdomainPick, TunnelRequest, TunnelResponse,
+    is_hop_by_hop,
+};
+
+type PendingRequests = Arc<RwLock<HashMap<String, oneshot::Sender<TunnelResponse>>>>;
+type TunnelSender = tokio::sync::mpsc::Sender<String>;
+
+struct TunnelConnection {
+    sender: TunnelSender,
+    pending: PendingRequests,
+    evict: tokio::sync::Notify,
+}
+
+struct RelayState {
+    tunnels: DashMap<String, Arc<TunnelConnection>>,
+    base_domain: String,
+    auth: AuthMode,
+    max_response_body: usize,
+}
+
+enum AuthMode {
+    Open,
+    Static(HashMap<String, Vec<String>>),
+    Provider(AuthProviderConfig),
+}
+
+fn token_to_subdomain(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    let hash = hasher.finalize();
+    hash[..6].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Build the relay Axum app without binding or serving.
+/// Returns `(router, port)` - the caller controls the TCP listener and shutdown.
+pub fn build_relay_app(cfg: RelayConfig) -> (Router, u16) {
+    let auth = if !cfg.tokens.is_empty() {
+        let count = cfg.tokens.len();
+        println!(
+            "  {} static tokens: {} token(s) configured",
+            colored::Colorize::green("ready"),
+            count,
+        );
+        AuthMode::Static(cfg.tokens)
+    } else if let Some(url) = cfg.auth_provider {
+        let secret = cfg
+            .auth_provider_secret
+            .expect("auth_provider_secret is required when auth_provider is set");
+        println!("  {} auth provider: {url}", colored::Colorize::green("ready"));
+        AuthMode::Provider(AuthProviderConfig {
+            url: url.trim_end_matches('/').to_string(),
+            secret,
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap(),
+        })
+    } else {
+        println!(
+            "  {} open mode (anyone can tunnel)",
+            colored::Colorize::yellow("warn"),
+        );
+        AuthMode::Open
+    };
+
+    const DEFAULT_MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024;
+    let max_response_body = cfg.max_response_body_size.unwrap_or(DEFAULT_MAX_RESPONSE_BODY);
+
+    let state = Arc::new(RelayState {
+        tunnels: DashMap::new(),
+        base_domain: cfg.relay_domain,
+        auth,
+        max_response_body,
+    });
+
+    const DEFAULT_MAX_REQUEST_BODY: usize = 5 * 1024 * 1024;
+    let max_body = cfg.max_request_body_size.unwrap_or(DEFAULT_MAX_REQUEST_BODY);
+
+    let app = Router::new()
+        .route("/_tunnel/register", any(handle_register))
+        .fallback(any(handle_tunnel_request))
+        .with_state(state)
+        .layer(DefaultBodyLimit::max(max_body));
+
+    (app, cfg.port)
+}
+
+async fn handle_register(ws: WebSocketUpgrade, State(state): State<Arc<RelayState>>) -> Response {
+    ws.on_upgrade(move |socket| handle_tunnel_ws(socket, state))
+}
+
+async fn handle_tunnel_ws(socket: WebSocket, state: Arc<RelayState>) {
+    let (mut ws_sink, mut ws_stream) = socket.split();
+
+    let reg: RegisterRequest = loop {
+        match ws_stream.next().await {
+            Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
+                Ok(req) => break req,
+                Err(_) => continue,
+            },
+            Some(Err(_)) | None => return,
+            _ => continue,
+        }
+    };
+
+    let token = reg.token;
+    let requested_subdomain = reg.subdomain;
+
+    async fn close_with_error(
+        ws_sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+        reason: &str,
+    ) {
+        let _ = ws_sink
+            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: 4001,
+                reason: reason.into(),
+            })))
+            .await;
+    }
+
+    async fn offer_and_pick(
+        ws_sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+        ws_stream: &mut futures_util::stream::SplitStream<WebSocket>,
+        allowed: &[String],
+    ) -> Option<String> {
+        let offer = SubdomainOffer { subdomains: allowed.to_vec() };
+        if ws_sink
+            .send(Message::Text(serde_json::to_string(&offer).unwrap().into()))
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        loop {
+            match ws_stream.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(pick) = serde_json::from_str::<SubdomainPick>(&text) {
+                        return Some(pick.subdomain);
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    async fn resolve_subdomain(
+        requested: Option<String>,
+        allowed: &[String],
+        ws_sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+        ws_stream: &mut futures_util::stream::SplitStream<WebSocket>,
+    ) -> Option<String> {
+        if let Some(ref sub) = requested
+            && subdomain_matches(allowed, sub)
+        {
+            return Some(sub.clone());
+        }
+        if allowed.len() == 1 && !allowed[0].contains('*') {
+            return Some(allowed[0].clone());
+        }
+        let picked = offer_and_pick(ws_sink, ws_stream, allowed).await?;
+        if subdomain_matches(allowed, &picked) {
+            Some(picked)
+        } else {
+            close_with_error(
+                ws_sink,
+                &format!("subdomain '{}' not authorized for this token", picked),
+            )
+            .await;
+            None
+        }
+    }
+
+    let subdomain = match &state.auth {
+        AuthMode::Open => Some(requested_subdomain.unwrap_or_else(|| token_to_subdomain(&token))),
+        AuthMode::Static(tokens) => match tokens.get(&token) {
+            Some(allowed) => {
+                resolve_subdomain(requested_subdomain, allowed, &mut ws_sink, &mut ws_stream).await
+            }
+            None => {
+                close_with_error(&mut ws_sink, "invalid token").await;
+                return;
+            }
+        },
+        AuthMode::Provider(auth) => {
+            let sub_for_verify = requested_subdomain.as_deref().unwrap_or("");
+            match verify_token(auth, &token, sub_for_verify).await {
+                Ok(allowed) => {
+                    resolve_subdomain(requested_subdomain, &allowed, &mut ws_sink, &mut ws_stream)
+                        .await
+                }
+                Err(AuthError::InvalidToken(msg)) => {
+                    close_with_error(&mut ws_sink, &msg).await;
+                    return;
+                }
+                Err(AuthError::ProviderUnavailable(msg)) => {
+                    eprintln!("  {} auth provider error: {msg}", colored::Colorize::red("error"));
+                    close_with_error(&mut ws_sink, "auth provider unavailable").await;
+                    return;
+                }
+            }
+        }
+    };
+
+    let subdomain = match subdomain {
+        Some(s) => s,
+        None => return,
+    };
+
+    let url = format!("https://{}.{}", subdomain, state.base_domain);
+
+    let ack = RegisterAck { subdomain: subdomain.clone(), url: url.clone() };
+    if ws_sink
+        .send(Message::Text(serde_json::to_string(&ack).unwrap().into()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+    let pending: PendingRequests = Arc::new(RwLock::new(HashMap::new()));
+    let conn = Arc::new(TunnelConnection {
+        sender: tx,
+        pending: pending.clone(),
+        evict: tokio::sync::Notify::new(),
+    });
+
+    if let Some((_, old)) = state.tunnels.remove(&subdomain) {
+        old.evict.notify_one();
+        println!("  {} evicted old tunnel: {subdomain}", colored::Colorize::yellow("warn"));
+    }
+
+    let conn_for_evict = conn.clone();
+    state.tunnels.insert(subdomain.clone(), conn);
+    println!("  {} tunnel registered: {}", colored::Colorize::green("ready"), colored::Colorize::cyan(url.as_str()));
+
+    let send_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    match msg {
+                        Some(msg) => {
+                            if ws_sink.send(Message::Text(msg.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                () = conn_for_evict.evict.notified() => {
+                    let _ = ws_sink
+                        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                            code: 4002,
+                            reason: "evicted: another client registered with the same tunnel".into(),
+                        })))
+                        .await;
+                    break;
+                }
+            }
+        }
+    });
+
+    while let Some(Ok(msg)) = ws_stream.next().await {
+        if let Message::Text(text) = msg
+            && let Ok(resp) = serde_json::from_str::<TunnelResponse>(&text)
+        {
+            let mut p = pending.write().await;
+            if let Some(sender) = p.remove(&resp.id) {
+                let _ = sender.send(resp);
+            }
+        }
+    }
+
+    send_task.abort();
+    state.tunnels.remove(&subdomain);
+    println!("  {} tunnel disconnected: {subdomain}", colored::Colorize::red("error"));
+}
+
+async fn handle_tunnel_request(
+    State(state): State<Arc<RelayState>>,
+    method: Method,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+    body: Bytes,
+) -> Response {
+    let host = headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let subdomain = host.split('.').next().unwrap_or("").to_string();
+    let path_str = uri.path_and_query().map(|p| p.to_string()).unwrap_or_else(|| "/".into());
+
+    if subdomain.is_empty() {
+        relay_log("-", method.as_str(), &path_str, 400, 0, std::time::Duration::ZERO);
+        return (StatusCode::BAD_REQUEST, "missing host header").into_response();
+    }
+
+    let conn = match state.tunnels.get(&subdomain) {
+        Some(c) => c.clone(),
+        None => {
+            relay_log(&subdomain, method.as_str(), &path_str, 502, 0, std::time::Duration::ZERO);
+            return (StatusCode::BAD_GATEWAY, "tunnel not found").into_response();
+        }
+    };
+
+    let req_id = uuid::Uuid::new_v4().to_string();
+    let mut req_headers = HashMap::new();
+    for (key, val) in headers.iter() {
+        if is_hop_by_hop(key.as_str()) { continue; }
+        if let Ok(v) = val.to_str() {
+            req_headers.insert(key.to_string(), v.to_string());
+        }
+    }
+
+    let body_b64 = if body.is_empty() {
+        None
+    } else {
+        Some(base64::engine::general_purpose::STANDARD.encode(&body))
+    };
+
+    let tunnel_req = TunnelRequest {
+        id: req_id.clone(),
+        method: method.to_string(),
+        path: uri.path_and_query().map(|p| p.to_string()).unwrap_or_else(|| "/".into()),
+        headers: req_headers,
+        body: body_b64,
+    };
+
+    let (resp_tx, resp_rx) = oneshot::channel();
+    conn.pending.write().await.insert(req_id.clone(), resp_tx);
+
+    let msg = serde_json::to_string(&tunnel_req).unwrap();
+    match conn.sender.try_send(msg) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            conn.pending.write().await.remove(&req_id);
+            relay_log(&subdomain, method.as_str(), &path_str, 503, 0, std::time::Duration::ZERO);
+            return (StatusCode::SERVICE_UNAVAILABLE, "tunnel overloaded").into_response();
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            conn.pending.write().await.remove(&req_id);
+            relay_log(&subdomain, method.as_str(), &path_str, 502, 0, std::time::Duration::ZERO);
+            return (StatusCode::BAD_GATEWAY, "tunnel disconnected").into_response();
+        }
+    }
+
+    let path = uri.path_and_query().map(|p| p.to_string()).unwrap_or_else(|| "/".into());
+    let start = std::time::Instant::now();
+
+    match tokio::time::timeout(std::time::Duration::from_secs(30), resp_rx).await {
+        Ok(Ok(resp)) => {
+            let status_code = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let body_len = resp.body.as_ref().map(|b| b.len()).unwrap_or(0);
+            relay_log(&subdomain, method.as_ref(), &path, resp.status, body_len, start.elapsed());
+
+            let mut builder = Response::builder().status(status_code);
+            for (k, v) in &resp.headers {
+                if is_hop_by_hop(k) { continue; }
+                if let (Ok(name), Ok(val)) = (
+                    HeaderName::from_bytes(k.as_bytes()),
+                    HeaderValue::from_str(v),
+                ) {
+                    builder = builder.header(name, val);
+                }
+            }
+
+            let max_b64_len = state.max_response_body * 4 / 3 + 4;
+            if resp.body.as_ref().is_some_and(|b| b.len() > max_b64_len) {
+                relay_log(&subdomain, method.as_ref(), &path, 502, 0, start.elapsed());
+                return (StatusCode::BAD_GATEWAY, "tunnel response body too large").into_response();
+            }
+
+            let body_bytes = resp
+                .body
+                .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+                .unwrap_or_default();
+
+            builder
+                .body(axum::body::Body::from(body_bytes))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+                })
+        }
+        Ok(Err(_)) => {
+            relay_log(&subdomain, method.as_ref(), &path, 502, 0, start.elapsed());
+            (StatusCode::BAD_GATEWAY, "tunnel dropped request").into_response()
+        }
+        Err(_) => {
+            conn.pending.write().await.remove(&req_id);
+            relay_log(&subdomain, method.as_ref(), &path, 504, 0, start.elapsed());
+            (StatusCode::GATEWAY_TIMEOUT, "tunnel timeout").into_response()
+        }
+    }
+}
+
+fn relay_log(subdomain: &str, method: &str, path: &str, status: u16, body_len: usize, duration: std::time::Duration) {
+    use colored::Colorize;
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    let status_str = if status < 300 {
+        format!("{status}").green().to_string()
+    } else if status < 400 {
+        format!("{status}").yellow().to_string()
+    } else {
+        format!("{status}").red().to_string()
+    };
+    println!(
+        "  {now}  {sub}  {method} {path}  -> {status}  {body_len}b  {ms}ms",
+        sub = subdomain.dimmed(),
+        status = status_str,
+        ms = duration.as_millis(),
+    );
+}

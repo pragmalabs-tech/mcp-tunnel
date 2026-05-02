@@ -1,0 +1,30 @@
+[package]
+name = "mcp-tunnel"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Self-hosted relay server for mcpr tunneling"
+repository = "https://github.com/pragmalabs-tech/mcp-tunnel"
+
+[[bin]]
+name = "mcp-tunnel"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+base64 = "0.22"
+sha2 = "0.11"
+uuid = { version = "1", features = ["v4"] }
+futures-util = "0.3"
+dashmap = "6"
+chrono = "0.4"
+colored = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
