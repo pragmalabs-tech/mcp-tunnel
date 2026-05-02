@@ -15,12 +15,13 @@ use futures_util::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
 use tokio::sync::{RwLock, oneshot};
 
-use crate::auth::{AuthError, AuthProviderConfig, subdomain_matches, verify_token};
-use crate::config::RelayConfig;
-use crate::protocol::{
+use mcp_tunnel_client::protocol::{
     RegisterAck, RegisterRequest, SubdomainOffer, SubdomainPick, TunnelRequest, TunnelResponse,
     is_hop_by_hop,
 };
+
+use crate::auth::{AuthError, AuthProviderConfig, subdomain_matches, verify_token};
+use crate::config::RelayConfig;
 
 type PendingRequests = Arc<RwLock<HashMap<String, oneshot::Sender<TunnelResponse>>>>;
 type TunnelSender = tokio::sync::mpsc::Sender<String>;

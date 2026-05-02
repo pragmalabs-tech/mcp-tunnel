@@ -10,10 +10,8 @@ Internet -> mcp-tunnel (this) -> WebSocket -> mcpr proxy -> MCP server
 ## Quick start
 
 ```sh
-docker run \
-  -e MCPR_RELAY_DOMAIN=tunnel.example.com \
-  -p 8080:8080 \
-  ghcr.io/pragmalabs-tech/mcp-tunnel
+docker run -p 8080:8080 ghcr.io/pragmalabs-tech/mcp-tunnel \
+  --domain tunnel.example.com
 ```
 
 On the client side, set `[tunnel]` in your `mcpr.toml`:
@@ -32,38 +30,42 @@ Then run `mcpr proxy run mcpr.toml`. The proxy connects to the relay and prints 
   tunnel public URL: https://myapp.tunnel.example.com
 ```
 
-## Configuration
+## CLI flags
 
-All configuration is via environment variables.
+```
+mcp-tunnel --domain <DOMAIN> [OPTIONS]
+```
 
-| Variable | Default | Required | Description |
+| Flag | Default | Required | Description |
 |---|---|---|---|
-| `MCPR_RELAY_DOMAIN` | - | yes | Base domain for tunnel subdomains |
-| `MCPR_RELAY_PORT` | `8080` | no | TCP listen port |
-| `MCPR_RELAY_AUTH_MODE` | `open` | no | Auth mode: `open`, `static`, or `provider` |
-| `MCPR_RELAY_TOKENS` | - | if `static` | JSON array of token entries (see below) |
-| `MCPR_RELAY_AUTH_URL` | - | if `provider` | Auth provider base URL |
-| `MCPR_RELAY_AUTH_SECRET` | - | if `provider` | Shared secret sent as `X-Relay-Secret` header |
-| `MCPR_RELAY_MAX_REQUEST_BODY` | `5242880` | no | Max inbound request body in bytes (5 MB) |
-| `MCPR_RELAY_MAX_RESPONSE_BODY` | `10485760` | no | Max tunneled response body in bytes (10 MB) |
+| `--domain <DOMAIN>` | - | yes | Base domain for tunnel subdomains |
+| `--port <PORT>` | `8080` | no | TCP listen port |
+| `--static-token <TOKEN:SUBS>` | - | no | Static token entry; repeatable. Format: `TOKEN:SUBDOMAIN[,SUBDOMAIN...]` |
+| `--auth-url <URL>` | - | no | Auth provider base URL (enables provider mode) |
+| `--auth-secret <SECRET>` | - | with `--auth-url` | Shared secret sent as `X-Relay-Secret` header |
+| `--max-request-body <BYTES>` | `5242880` | no | Max inbound request body in bytes (5 MB) |
+| `--max-response-body <BYTES>` | `10485760` | no | Max tunneled response body in bytes (10 MB) |
+
+`--static-token` and `--auth-url` are mutually exclusive. Without either, the relay runs in open mode.
 
 ## Auth modes
 
-### open
+### Open
 
 No authentication. Any client can register a tunnel. Suitable for private networks or local development.
 
 ```sh
-MCPR_RELAY_AUTH_MODE=open
+mcp-tunnel --domain tunnel.example.com
 ```
 
-### static
+### Static
 
-Token list defined at startup via `MCPR_RELAY_TOKENS`. Each entry maps a token to a list of allowed subdomain patterns.
+Token list defined at startup via repeated `--static-token` flags. Each entry maps a token to a list of allowed subdomain patterns.
 
 ```sh
-MCPR_RELAY_AUTH_MODE=static
-MCPR_RELAY_TOKENS='[{"token":"tok_abc","subdomains":["myapp","myapp-*"]}]'
+mcp-tunnel --domain tunnel.example.com \
+  --static-token tok_abc:myapp,myapp-* \
+  --static-token tok_xyz:other-app
 ```
 
 Subdomain patterns support a single `*` wildcard:
@@ -76,23 +78,23 @@ Subdomain patterns support a single `*` wildcard:
 | `pr-*-corp` | `pr-123-corp`, `pr-abc-corp` |
 | `*` | anything |
 
-### provider
+### Provider
 
 Delegates token verification to an external HTTP endpoint. Used with [mcpr cloud](https://mcpr.app) or a custom auth service.
 
 ```sh
-MCPR_RELAY_AUTH_MODE=provider
-MCPR_RELAY_AUTH_URL=https://api.mcpr.app
-MCPR_RELAY_AUTH_SECRET=<shared-secret>
+mcp-tunnel --domain tunnel.example.com \
+  --auth-url https://api.mcpr.app \
+  --auth-secret <shared-secret>
 ```
 
-The relay calls `POST {MCPR_RELAY_AUTH_URL}/api/verify` with:
+The relay calls `POST {auth-url}/api/verify` with:
 
 ```json
 { "token": "tok_abc", "subdomain": "myapp" }
 ```
 
-Header: `X-Relay-Secret: <MCPR_RELAY_AUTH_SECRET>`
+Header: `X-Relay-Secret: <auth-secret>`
 
 Expected response:
 
@@ -111,11 +113,10 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
-    environment:
-      MCPR_RELAY_DOMAIN: tunnel.example.com
-      MCPR_RELAY_AUTH_MODE: provider
-      MCPR_RELAY_AUTH_URL: https://api.mcpr.app
-      MCPR_RELAY_AUTH_SECRET: ${RELAY_SECRET}
+    command:
+      - --domain=tunnel.example.com
+      - --auth-url=https://api.mcpr.app
+      - --auth-secret=${RELAY_SECRET}
 ```
 
 Traffic must reach the container with the correct `Host` header. Sit a reverse proxy (nginx, Caddy, Traefik) in front and route `*.tunnel.example.com` to port 8080.
@@ -143,20 +144,52 @@ server {
 
 The wildcard TLS certificate covers `*.tunnel.example.com`. Let's Encrypt supports wildcard certs via DNS-01 challenge.
 
+## Client library
+
+To embed the tunnel client directly into your own MCP server (no separate `mcpr proxy run` process needed), use the [`mcp-tunnel-client`](crates/mcp-tunnel-client) crate published to crates.io:
+
+```toml
+[dependencies]
+mcp-tunnel-client = "0.1"
+```
+
+```rust
+use mcp_tunnel_client::start_tunnel_client;
+
+let public_url = start_tunnel_client(9000, "https://tunnel.example.com", "tok_abc", Some("myapp"), MyStatus).await?;
+```
+
+See [crates/mcp-tunnel-client/README.md](crates/mcp-tunnel-client/README.md) for the full API.
+
 ## Build from source
 
-Requires Rust 1.92+.
+Requires Rust 1.92+. This is a Cargo workspace with two crates:
+
+- `crates/mcp-tunnel` — the relay binary (this is what runs in the Docker image)
+- `crates/mcp-tunnel-client` — the client library, published to crates.io
 
 ```sh
 cargo build --release
-./target/release/mcp-tunnel
+./target/release/mcp-tunnel --domain tunnel.example.com
 ```
+
+## Releasing
+
+Releases are driven by [`cargo-release`](https://github.com/crate-ci/cargo-release):
+
+```sh
+cargo install cargo-release             # one-time
+cargo release minor                     # dry run
+cargo release minor --execute           # bump, commit, tag, publish, push
+```
+
+This bumps both crates to the same version, publishes `mcp-tunnel-client` to crates.io (the binary is `publish = false`), tags `vX.Y.Z`, and pushes. GitHub Actions then sees the tag and builds/pushes the multi-arch Docker image to ghcr.io.
 
 ## How it works
 
 1. `mcpr proxy run` opens a WebSocket to `/_tunnel/register` and sends a registration message with its auth token.
 2. The relay authenticates the token, assigns a subdomain, and acknowledges with the public URL.
-3. Inbound HTTP requests arrive at `{subdomain}.{MCPR_RELAY_DOMAIN}`. The relay extracts the subdomain from the `Host` header, finds the matching WebSocket connection, and forwards the request as a JSON message.
+3. Inbound HTTP requests arrive at `{subdomain}.{domain}`. The relay extracts the subdomain from the `Host` header, finds the matching WebSocket connection, and forwards the request as a JSON message.
 4. The proxy receives the request, forwards it to the local MCP server, and sends the response back through the WebSocket.
 5. If a second client registers the same subdomain, the relay evicts the previous connection (close code 4002).
 

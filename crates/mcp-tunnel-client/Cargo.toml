@@ -1,0 +1,20 @@
+[package]
+name = "mcp-tunnel-client"
+description = "Client library to connect a local HTTP/MCP server to an mcp-tunnel relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["mcp", "tunnel", "websocket", "proxy"]
+categories = ["network-programming", "web-programming::websocket"]
+
+[dependencies]
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures-util = { workspace = true }
+base64 = { workspace = true }
+reqwest = { workspace = true }
+colored = { workspace = true }

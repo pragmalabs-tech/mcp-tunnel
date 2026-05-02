@@ -1,11 +1,10 @@
 mod auth;
 mod config;
-mod protocol;
 mod relay;
 
 #[tokio::main]
 async fn main() {
-    let cfg = config::load_from_env();
+    let cfg = config::load();
     let (app, port) = relay::build_relay_app(cfg);
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))

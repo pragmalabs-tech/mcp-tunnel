@@ -1,0 +1,28 @@
+[package]
+name = "mcp-tunnel"
+description = "Self-hosted relay server for mcpr tunneling"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "mcp-tunnel"
+path = "src/main.rs"
+
+[dependencies]
+mcp-tunnel-client = { path = "../mcp-tunnel-client", version = "0.1.0" }
+axum = { version = "0.8", features = ["ws"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+reqwest = { workspace = true }
+base64 = { workspace = true }
+sha2 = "0.11"
+uuid = { version = "1", features = ["v4"] }
+futures-util = { workspace = true }
+dashmap = "6"
+chrono = "0.4"
+colored = { workspace = true }

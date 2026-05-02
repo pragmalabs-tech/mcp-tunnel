@@ -30,8 +30,6 @@ RUN addgroup -S -g 10001 relay \
 
 COPY --from=builder /app/target/release/mcp-tunnel /usr/local/bin/mcp-tunnel
 
-ENV MCPR_RELAY_PORT=8080
-
 EXPOSE 8080
 
 USER relay
