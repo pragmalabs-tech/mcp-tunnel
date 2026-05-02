@@ -36,3 +36,7 @@ USER relay
 WORKDIR /var/lib/relay
 
 ENTRYPOINT ["/sbin/tini", "--", "mcp-tunnel"]
+
+LABEL org.opencontainers.image.source="https://github.com/pragmalabs-tech/mcp-tunnel" \
+      org.opencontainers.image.description="Self-hosted HTTP tunnel relay server" \
+      org.opencontainers.image.licenses="Apache-2.0"
