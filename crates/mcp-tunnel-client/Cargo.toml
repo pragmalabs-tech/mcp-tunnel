@@ -12,9 +12,12 @@ categories = ["network-programming", "web-programming::websocket"]
 [dependencies]
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 futures-util = { workspace = true }
 base64 = { workspace = true }
 reqwest = { workspace = true }
 colored = { workspace = true }
+dashmap = "6"

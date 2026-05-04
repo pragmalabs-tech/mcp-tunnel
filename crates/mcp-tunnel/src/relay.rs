@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
@@ -13,17 +14,44 @@ use base64::Engine;
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::{mpsc, oneshot};
 
 use mcp_tunnel_client::protocol::{
-    RegisterAck, RegisterRequest, SubdomainOffer, SubdomainPick, TunnelRequest, TunnelResponse,
+    RegisterAck, RegisterRequest, SubdomainOffer, SubdomainPick, TunnelMessage, TunnelRequest,
     is_hop_by_hop,
 };
 
 use crate::auth::{AuthError, AuthProviderConfig, subdomain_matches, verify_token};
 use crate::config::RelayConfig;
 
-type PendingRequests = Arc<RwLock<HashMap<String, oneshot::Sender<TunnelResponse>>>>;
+/// Bytes the body channel buffers before backpressuring the WS recv
+/// task. Smaller = stronger backpressure but more context switches.
+const BODY_CHANNEL_DEPTH: usize = 32;
+
+/// Headers-only timeout. Matches the tunnel-client side. Body streams
+/// indefinitely once head arrives.
+const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Per-request state tracked by the relay between sending `Request` to
+/// the tunnel-client and the matching response stream completing.
+enum InFlight {
+    /// Waiting for `ResponseHead`. The oneshot fires with the head and
+    /// the receiver end of a fresh body channel.
+    AwaitingHead(oneshot::Sender<HeadAndBody>),
+    /// Head delivered. Subsequent `ResponseChunk` frames are pushed
+    /// into this sender. When the matching receiver is dropped (axum
+    /// finished or the public client disconnected) the sender errors,
+    /// the cancel watcher emits `Cancel`, and this entry is removed.
+    Streaming(mpsc::Sender<Result<Bytes, std::io::Error>>),
+}
+
+struct HeadAndBody {
+    status: u16,
+    headers: HashMap<String, String>,
+    body_rx: mpsc::Receiver<Result<Bytes, std::io::Error>>,
+}
+
+type PendingRequests = Arc<DashMap<String, InFlight>>;
 type TunnelSender = tokio::sync::mpsc::Sender<String>;
 
 struct TunnelConnection {
@@ -36,7 +64,6 @@ struct RelayState {
     tunnels: DashMap<String, Arc<TunnelConnection>>,
     base_domain: String,
     auth: AuthMode,
-    max_response_body: usize,
 }
 
 enum AuthMode {
@@ -87,16 +114,10 @@ pub fn build_relay_app(cfg: RelayConfig) -> (Router, u16) {
         AuthMode::Open
     };
 
-    const DEFAULT_MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024;
-    let max_response_body = cfg
-        .max_response_body_size
-        .unwrap_or(DEFAULT_MAX_RESPONSE_BODY);
-
     let state = Arc::new(RelayState {
         tunnels: DashMap::new(),
         base_domain: cfg.relay_domain,
         auth,
-        max_response_body,
     });
 
     const DEFAULT_MAX_REQUEST_BODY: usize = 5 * 1024 * 1024;
@@ -254,7 +275,7 @@ async fn handle_tunnel_ws(socket: WebSocket, state: Arc<RelayState>) {
     }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
-    let pending: PendingRequests = Arc::new(RwLock::new(HashMap::new()));
+    let pending: PendingRequests = Arc::new(DashMap::new());
     let conn = Arc::new(TunnelConnection {
         sender: tx,
         pending: pending.clone(),
@@ -304,13 +325,8 @@ async fn handle_tunnel_ws(socket: WebSocket, state: Arc<RelayState>) {
     });
 
     while let Some(Ok(msg)) = ws_stream.next().await {
-        if let Message::Text(text) = msg
-            && let Ok(resp) = serde_json::from_str::<TunnelResponse>(&text)
-        {
-            let mut p = pending.write().await;
-            if let Some(sender) = p.remove(&resp.id) {
-                let _ = sender.send(resp);
-            }
+        if let Message::Text(text) = msg {
+            dispatch_frame(&text, &pending).await;
         }
     }
 
@@ -320,6 +336,84 @@ async fn handle_tunnel_ws(socket: WebSocket, state: Arc<RelayState>) {
         "  {} tunnel disconnected: {subdomain}",
         colored::Colorize::red("error")
     );
+}
+
+/// Route an incoming WS text frame from the tunnel-client to the right
+/// per-request channel.
+async fn dispatch_frame(text: &str, pending: &PendingRequests) {
+    let msg = match serde_json::from_str::<TunnelMessage>(text) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    match msg {
+        TunnelMessage::ResponseHead {
+            id,
+            status,
+            headers,
+        } => {
+            // Replace AwaitingHead with Streaming. If the entry is missing
+            // (cancelled or unknown id), drop the message.
+            let Some((_, slot)) = pending.remove(&id) else {
+                return;
+            };
+            let InFlight::AwaitingHead(head_tx) = slot else {
+                return;
+            };
+            let (body_tx, body_rx) =
+                mpsc::channel::<Result<Bytes, std::io::Error>>(BODY_CHANNEL_DEPTH);
+            pending.insert(id, InFlight::Streaming(body_tx));
+            let _ = head_tx.send(HeadAndBody {
+                status,
+                headers,
+                body_rx,
+            });
+        }
+        TunnelMessage::ResponseChunk { id, data, last } => {
+            let Some(slot) = pending.get(&id) else {
+                return;
+            };
+            let InFlight::Streaming(tx) = slot.value() else {
+                return;
+            };
+            if !data.is_empty()
+                && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&data)
+            {
+                // If the receiver is gone (axum dropped the body), the
+                // send errors silently. The cancel watcher will detect
+                // that and clean up.
+                let _ = tx.send(Ok(Bytes::from(bytes))).await;
+            }
+            // Drop the slot guard so the remove() below can take it.
+            drop(slot);
+            if last {
+                pending.remove(&id);
+            }
+        }
+        TunnelMessage::ResponseError { id, message } => {
+            let Some((_, slot)) = pending.remove(&id) else {
+                return;
+            };
+            match slot {
+                InFlight::AwaitingHead(head_tx) => {
+                    let (synth_tx, body_rx) = mpsc::channel::<Result<Bytes, _>>(1);
+                    let body_msg = format!("upstream error: {message}").into_bytes();
+                    let _ = synth_tx.send(Ok(Bytes::from(body_msg))).await;
+                    drop(synth_tx);
+                    let _ = head_tx.send(HeadAndBody {
+                        status: 502,
+                        headers: HashMap::new(),
+                        body_rx,
+                    });
+                }
+                InFlight::Streaming(tx) => {
+                    let _ = tx.send(Err(std::io::Error::other(message))).await;
+                }
+            }
+        }
+        TunnelMessage::Request(_) | TunnelMessage::Cancel { .. } => {
+            // Frames sent the wrong direction; ignore.
+        }
+    }
 }
 
 async fn handle_tunnel_request(
@@ -345,7 +439,6 @@ async fn handle_tunnel_request(
             method.as_str(),
             &path_str,
             400,
-            0,
             std::time::Duration::ZERO,
         );
         return (StatusCode::BAD_REQUEST, "missing host header").into_response();
@@ -359,7 +452,6 @@ async fn handle_tunnel_request(
                 method.as_str(),
                 &path_str,
                 502,
-                0,
                 std::time::Duration::ZERO,
             );
             return (StatusCode::BAD_GATEWAY, "tunnel not found").into_response();
@@ -391,92 +483,128 @@ async fn handle_tunnel_request(
         body: body_b64,
     };
 
-    let (resp_tx, resp_rx) = oneshot::channel();
-    let msg = serde_json::to_string(&tunnel_req).unwrap();
-    match conn.sender.try_send(msg) {
-        Ok(()) => {
-            conn.pending.write().await.insert(req_id.clone(), resp_tx);
-        }
+    let (head_tx, head_rx) = oneshot::channel::<HeadAndBody>();
+    conn.pending
+        .insert(req_id.clone(), InFlight::AwaitingHead(head_tx));
+
+    let frame = serde_json::to_string(&TunnelMessage::Request(tunnel_req)).unwrap();
+    match conn.sender.try_send(frame) {
+        Ok(()) => {}
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            conn.pending.remove(&req_id);
             relay_log(
                 &subdomain,
                 method.as_str(),
                 &path_str,
                 503,
-                0,
                 std::time::Duration::ZERO,
             );
             return (StatusCode::SERVICE_UNAVAILABLE, "tunnel overloaded").into_response();
         }
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            conn.pending.remove(&req_id);
             relay_log(
                 &subdomain,
                 method.as_str(),
                 &path_str,
                 502,
-                0,
                 std::time::Duration::ZERO,
             );
             return (StatusCode::BAD_GATEWAY, "tunnel disconnected").into_response();
         }
     }
 
-    let path = path_str;
     let start = std::time::Instant::now();
 
-    match tokio::time::timeout(std::time::Duration::from_secs(30), resp_rx).await {
-        Ok(Ok(resp)) => {
-            let status_code = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
-            let body_len = resp.body.as_ref().map(|b| b.len()).unwrap_or(0);
-            relay_log(
-                &subdomain,
-                method.as_ref(),
-                &path,
-                resp.status,
-                body_len,
-                start.elapsed(),
-            );
-
-            let mut builder = Response::builder().status(status_code);
-            for (k, v) in &resp.headers {
-                if is_hop_by_hop(k) {
-                    continue;
-                }
-                if let (Ok(name), Ok(val)) = (
-                    HeaderName::from_bytes(k.as_bytes()),
-                    HeaderValue::from_str(v),
-                ) {
-                    builder = builder.header(name, val);
-                }
-            }
-
-            let max_b64_len = state.max_response_body * 4 / 3 + 4;
-            if resp.body.as_ref().is_some_and(|b| b.len() > max_b64_len) {
-                relay_log(&subdomain, method.as_ref(), &path, 502, 0, start.elapsed());
-                return (StatusCode::BAD_GATEWAY, "tunnel response body too large").into_response();
-            }
-
-            let body_bytes = resp
-                .body
-                .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
-                .unwrap_or_default();
-
-            builder
-                .body(axum::body::Body::from(body_bytes))
-                .unwrap_or_else(|_| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
-                })
-        }
+    let head = match tokio::time::timeout(HEAD_TIMEOUT, head_rx).await {
+        Ok(Ok(h)) => h,
         Ok(Err(_)) => {
-            relay_log(&subdomain, method.as_ref(), &path, 502, 0, start.elapsed());
-            (StatusCode::BAD_GATEWAY, "tunnel dropped request").into_response()
+            conn.pending.remove(&req_id);
+            relay_log(&subdomain, method.as_str(), &path_str, 502, start.elapsed());
+            return (StatusCode::BAD_GATEWAY, "tunnel dropped request").into_response();
         }
         Err(_) => {
-            conn.pending.write().await.remove(&req_id);
-            relay_log(&subdomain, method.as_ref(), &path, 504, 0, start.elapsed());
-            (StatusCode::GATEWAY_TIMEOUT, "tunnel timeout").into_response()
+            conn.pending.remove(&req_id);
+            send_cancel(&conn, &req_id).await;
+            relay_log(&subdomain, method.as_str(), &path_str, 504, start.elapsed());
+            return (StatusCode::GATEWAY_TIMEOUT, "tunnel headers timeout").into_response();
+        }
+    };
+
+    relay_log(
+        &subdomain,
+        method.as_str(),
+        &path_str,
+        head.status,
+        start.elapsed(),
+    );
+
+    // Build the streaming response. The body channel keeps draining as
+    // long as the response body is alive on the public client side.
+    let mut builder = Response::builder()
+        .status(StatusCode::from_u16(head.status).unwrap_or(StatusCode::BAD_GATEWAY));
+    for (k, v) in &head.headers {
+        if is_hop_by_hop(k) {
+            continue;
+        }
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
+            builder = builder.header(name, val);
         }
     }
+
+    // Spawn a watcher: when the body's mpsc receiver is dropped (axum
+    // finished writing or the client disconnected), send Cancel and
+    // remove the pending entry. Without this, in-flight upstream
+    // streams would leak indefinitely on disconnect.
+    spawn_cancel_watcher(conn.clone(), req_id.clone());
+
+    let body_stream = tokio_stream::wrappers::ReceiverStream::new(head.body_rx);
+    let body = axum::body::Body::from_stream(body_stream);
+    builder.body(body).unwrap_or_else(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+    })
+}
+
+/// Wait for the body sender held in `pending` to lose its matching
+/// receiver (axum dropped it). Then send `Cancel` to the tunnel-client
+/// and clear the pending entry. If the entry is removed by the chunk
+/// terminator first (clean end), this task exits quietly.
+fn spawn_cancel_watcher(conn: Arc<TunnelConnection>, id: String) {
+    tokio::spawn(async move {
+        // Grab the sender's `closed()` future. If the slot isn't
+        // Streaming yet (head still pending), wait until it is, then
+        // poll. Simplest implementation: poll with a short interval.
+        loop {
+            let slot = conn.pending.get(&id);
+            match slot.as_deref() {
+                Some(InFlight::Streaming(tx)) => {
+                    let tx = tx.clone();
+                    drop(slot);
+                    tx.closed().await;
+                    // Receiver dropped. If the entry is still there, it
+                    // means the stream didn't finish naturally, so the
+                    // upstream is still going. Cancel it.
+                    if conn.pending.remove(&id).is_some() {
+                        send_cancel(&conn, &id).await;
+                    }
+                    return;
+                }
+                Some(InFlight::AwaitingHead(_)) => {
+                    drop(slot);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                None => return,
+            }
+        }
+    });
+}
+
+async fn send_cancel(conn: &TunnelConnection, id: &str) {
+    let frame = serde_json::to_string(&TunnelMessage::Cancel { id: id.to_string() }).unwrap();
+    let _ = conn.sender.try_send(frame);
 }
 
 fn relay_log(
@@ -484,7 +612,6 @@ fn relay_log(
     method: &str,
     path: &str,
     status: u16,
-    body_len: usize,
     duration: std::time::Duration,
 ) {
     use colored::Colorize;
@@ -497,7 +624,7 @@ fn relay_log(
         format!("{status}").red().to_string()
     };
     println!(
-        "  {now}  {sub}  {method} {path}  -> {status}  {body_len}b  {ms}ms",
+        "  {now}  {sub}  {method} {path}  -> {status}  {ms}ms",
         sub = subdomain.dimmed(),
         status = status_str,
         ms = duration.as_millis(),

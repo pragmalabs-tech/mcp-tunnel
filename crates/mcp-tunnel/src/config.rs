@@ -28,10 +28,6 @@ pub struct Cli {
     /// Max inbound request body in bytes
     #[arg(long, default_value_t = 5 * 1024 * 1024)]
     pub max_request_body: usize,
-
-    /// Max tunneled response body in bytes
-    #[arg(long, default_value_t = 10 * 1024 * 1024)]
-    pub max_response_body: usize,
 }
 
 pub struct RelayConfig {
@@ -41,7 +37,6 @@ pub struct RelayConfig {
     pub auth_provider_secret: Option<String>,
     pub tokens: HashMap<String, Vec<String>>,
     pub max_request_body_size: Option<usize>,
-    pub max_response_body_size: Option<usize>,
 }
 
 pub fn load() -> RelayConfig {
@@ -59,7 +54,6 @@ pub fn load() -> RelayConfig {
         auth_provider_secret: cli.auth_secret,
         tokens: parse_tokens(&cli.static_tokens),
         max_request_body_size: Some(cli.max_request_body),
-        max_response_body_size: Some(cli.max_response_body),
     }
 }
 

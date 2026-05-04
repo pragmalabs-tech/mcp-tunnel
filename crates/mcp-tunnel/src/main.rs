@@ -1,6 +1,4 @@
-mod auth;
-mod config;
-mod relay;
+use mcp_tunnel::{config, relay};
 
 #[tokio::main]
 async fn main() {

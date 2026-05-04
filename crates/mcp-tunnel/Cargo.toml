@@ -7,14 +7,21 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[lib]
+name = "mcp_tunnel"
+path = "src/lib.rs"
+
 [[bin]]
 name = "mcp-tunnel"
 path = "src/main.rs"
 
 [dependencies]
-mcp-tunnel-client = { path = "../mcp-tunnel-client", version = "0.1.0" }
+mcp-tunnel-client = { path = "../mcp-tunnel-client", version = "0.2.0" }
 axum = { version = "0.8", features = ["ws"] }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { version = "4", features = ["derive"] }

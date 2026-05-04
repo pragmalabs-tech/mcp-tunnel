@@ -1,14 +1,28 @@
 //! Tunnel client - connects to a relay server and proxies requests to localhost.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine;
+use bytes::Bytes;
+use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
+use tokio_util::sync::CancellationToken;
 
 use crate::protocol::{
-    RegisterAck, RegisterRequest, SubdomainOffer, SubdomainPick, TunnelRequest, TunnelResponse,
+    RegisterAck, RegisterRequest, SubdomainOffer, SubdomainPick, TunnelMessage, TunnelRequest,
     is_hop_by_hop,
 };
+
+/// Headers-only timeout. The body can stream as long as the upstream
+/// keeps it open. This bound only catches connect/handshake stalls.
+const HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bytes per response chunk frame. Larger = fewer frames but bigger
+/// memory bursts; smaller = chattier WS but smoother backpressure.
+/// 64 KiB is a sweet spot for SSE traffic.
+const CHUNK_SIZE: usize = 64 * 1024;
 
 /// Callback for tunnel status changes.
 pub trait TunnelStatusCallback: Send + Sync + 'static {
@@ -88,10 +102,14 @@ pub async fn start_tunnel_client(
 
     let public_url = ack.url.clone();
     let local_base = format!("http://localhost:{port}");
+
+    // No HTTP-level timeout on reqwest: we want to stream long-lived SSE
+    // responses indefinitely. A `connect_timeout` covers TCP handshake;
+    // a per-request `tokio::time::timeout` around `.send()` covers the
+    // headers wait separately (HEADERS_TIMEOUT).
     let http_client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(30))
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .connect_timeout(Duration::from_secs(5))
+        .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(10)
         .build()
         .expect("Failed to build tunnel HTTP client");
@@ -100,6 +118,7 @@ pub async fn start_tunnel_client(
 
     tokio::spawn(async move {
         let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let in_flight: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
 
         let send_task = tokio::spawn(async move {
             while let Some(msg) = resp_rx.recv().await {
@@ -117,16 +136,30 @@ pub async fn start_tunnel_client(
         while let Some(Ok(msg)) = ws_stream.next().await {
             match msg {
                 tokio_tungstenite::tungstenite::Message::Text(text) => {
-                    if let Ok(req) = serde_json::from_str::<TunnelRequest>(&text) {
-                        let client = http_client.clone();
-                        let base = local_base.clone();
-                        let tx = resp_tx.clone();
+                    match serde_json::from_str::<TunnelMessage>(&text) {
+                        Ok(TunnelMessage::Request(req)) => {
+                            let client = http_client.clone();
+                            let base = local_base.clone();
+                            let tx = resp_tx.clone();
+                            let in_flight_clone = in_flight.clone();
+                            let token = CancellationToken::new();
+                            in_flight.insert(req.id.clone(), token.clone());
 
-                        tokio::spawn(async move {
-                            let resp = forward_to_local(&client, &base, req).await;
-                            let msg = serde_json::to_string(&resp).unwrap();
-                            let _ = tx.send(msg);
-                        });
+                            tokio::spawn(async move {
+                                let id = req.id.clone();
+                                forward_to_local(&client, &base, req, tx, token).await;
+                                in_flight_clone.remove(&id);
+                            });
+                        }
+                        Ok(TunnelMessage::Cancel { id }) => {
+                            if let Some((_, token)) = in_flight.remove(&id) {
+                                token.cancel();
+                            }
+                        }
+                        // Frames not addressed to the tunnel-client side are
+                        // silently dropped: defensive against future protocol
+                        // additions without forcing a coordinated upgrade.
+                        Ok(_) | Err(_) => {}
                     }
                 }
                 tokio_tungstenite::tungstenite::Message::Close(Some(frame))
@@ -159,11 +192,17 @@ pub async fn start_tunnel_client(
     Ok(public_url)
 }
 
+/// Forward one tunnel request upstream and stream the response back as
+/// `ResponseHead` + `ResponseChunk*` + terminator (`last: true`). On
+/// upstream error before headers, sends `ResponseError` and returns
+/// without a terminator (the relay synthesizes a 502).
 async fn forward_to_local(
     client: &reqwest::Client,
     base_url: &str,
     req: TunnelRequest,
-) -> TunnelResponse {
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
+    cancel: CancellationToken,
+) {
     let url = format!("{base_url}{}", req.path);
     let method: reqwest::Method = req.method.parse().unwrap_or(reqwest::Method::GET);
 
@@ -185,37 +224,112 @@ async fn forward_to_local(
         builder = builder.body(body);
     }
 
-    match builder.send().await {
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            let mut headers = HashMap::new();
-            for (k, v) in resp.headers() {
-                if is_hop_by_hop(k.as_str()) {
-                    continue;
-                }
-                if let Ok(val) = v.to_str() {
-                    headers.insert(k.to_string(), val.to_string());
-                }
-            }
-            let body = resp.bytes().await.unwrap_or_default();
-            let body_b64 = if body.is_empty() {
-                None
-            } else {
-                Some(base64::engine::general_purpose::STANDARD.encode(&body))
-            };
-            TunnelResponse {
-                id: req.id,
-                status,
-                headers,
-                body: body_b64,
-            }
+    // Headers-only timeout: only bounds the wait for the upstream to
+    // produce response headers. Once we have the head, the body streams
+    // for as long as the upstream keeps it open.
+    let send_fut = builder.send();
+    let resp = match tokio::time::timeout(HEADERS_TIMEOUT, send_fut).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            send_msg(
+                &tx,
+                &TunnelMessage::ResponseError {
+                    id: req.id,
+                    message: format!("upstream error: {e}"),
+                },
+            );
+            return;
         }
-        Err(_) => TunnelResponse {
-            id: req.id,
-            status: 502,
-            headers: HashMap::new(),
-            body: Some(base64::engine::general_purpose::STANDARD.encode(b"upstream error")),
+        Err(_) => {
+            send_msg(
+                &tx,
+                &TunnelMessage::ResponseError {
+                    id: req.id,
+                    message: "upstream headers timeout".into(),
+                },
+            );
+            return;
+        }
+    };
+
+    let status = resp.status().as_u16();
+    let mut headers = HashMap::new();
+    for (k, v) in resp.headers() {
+        if is_hop_by_hop(k.as_str()) {
+            continue;
+        }
+        if let Ok(val) = v.to_str() {
+            headers.insert(k.to_string(), val.to_string());
+        }
+    }
+
+    if !send_msg(
+        &tx,
+        &TunnelMessage::ResponseHead {
+            id: req.id.clone(),
+            status,
+            headers,
         },
+    ) {
+        return;
+    }
+
+    let mut stream = resp.bytes_stream();
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            chunk = stream.next() => match chunk {
+                Some(Ok(bytes)) => {
+                    if !send_chunks(&tx, &req.id, bytes) {
+                        return;
+                    }
+                }
+                Some(Err(_)) | None => break,
+            },
+        }
+    }
+
+    // Always send terminator on graceful end. (Cancellation also sends
+    // it so the relay can release the response body cleanly; if the WS
+    // is gone the send_msg call is a no-op.)
+    send_msg(
+        &tx,
+        &TunnelMessage::ResponseChunk {
+            id: req.id,
+            data: String::new(),
+            last: true,
+        },
+    );
+}
+
+/// Split `bytes` into one or more `ResponseChunk` frames bounded by
+/// [`CHUNK_SIZE`] and send them. Returns `false` if the WS sink is gone.
+fn send_chunks(tx: &tokio::sync::mpsc::UnboundedSender<String>, id: &str, bytes: Bytes) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let end = (offset + CHUNK_SIZE).min(bytes.len());
+        let slice = &bytes[offset..end];
+        let msg = TunnelMessage::ResponseChunk {
+            id: id.to_string(),
+            data: base64::engine::general_purpose::STANDARD.encode(slice),
+            last: false,
+        };
+        if !send_msg(tx, &msg) {
+            return false;
+        }
+        offset = end;
+    }
+    true
+}
+
+fn send_msg(tx: &tokio::sync::mpsc::UnboundedSender<String>, msg: &TunnelMessage) -> bool {
+    match serde_json::to_string(msg) {
+        Ok(s) => tx.send(s).is_ok(),
+        Err(_) => false,
     }
 }
 
@@ -254,4 +368,70 @@ fn pick_subdomain(subdomains: &[String]) -> Result<String, String> {
     }
 
     Ok(input.to_string())
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod tests {
+    use super::*;
+
+    use bytes::Bytes;
+
+    fn collect_messages(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) -> Vec<TunnelMessage> {
+        let mut out = Vec::new();
+        while let Ok(s) = rx.try_recv() {
+            out.push(serde_json::from_str(&s).expect("valid frame"));
+        }
+        out
+    }
+
+    #[test]
+    fn send_chunks__splits_at_chunk_size_boundary() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let body = Bytes::from(vec![0u8; CHUNK_SIZE * 2 + 100]);
+        assert!(send_chunks(&tx, "rid", body));
+        let msgs = collect_messages(&mut rx);
+        assert_eq!(msgs.len(), 3);
+        for m in &msgs {
+            match m {
+                TunnelMessage::ResponseChunk { id, last, .. } => {
+                    assert_eq!(id, "rid");
+                    assert!(!last);
+                }
+                _ => panic!("expected ResponseChunk"),
+            }
+        }
+    }
+
+    #[test]
+    fn send_chunks__empty_bytes_emits_no_frames() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        assert!(send_chunks(&tx, "rid", Bytes::new()));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn send_chunks__small_bytes_emit_one_frame_round_trips_base64() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        send_chunks(&tx, "rid", Bytes::from_static(b"hello"));
+        let msgs = collect_messages(&mut rx);
+        assert_eq!(msgs.len(), 1);
+        let TunnelMessage::ResponseChunk { data, .. } = &msgs[0] else {
+            panic!()
+        };
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap();
+        assert_eq!(decoded, b"hello");
+    }
+
+    #[test]
+    fn send_msg__returns_false_when_receiver_dropped() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        drop(rx);
+        let msg = TunnelMessage::Cancel { id: "x".into() };
+        assert!(!send_msg(&tx, &msg));
+    }
 }
