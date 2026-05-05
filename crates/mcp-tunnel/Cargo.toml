@@ -16,7 +16,7 @@ name = "mcp-tunnel"
 path = "src/main.rs"
 
 [dependencies]
-mcp-tunnel-client = { path = "../mcp-tunnel-client", version = "0.2.0" }
+mcp-tunnel-client = { path = "../mcp-tunnel-client", version = "0.2.1" }
 axum = { version = "0.8", features = ["ws"] }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
