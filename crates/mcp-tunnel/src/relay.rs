@@ -291,6 +291,7 @@ async fn handle_tunnel_ws(socket: WebSocket, state: Arc<RelayState>) {
     }
 
     let conn_for_evict = conn.clone();
+    let conn_for_dispatch = conn.clone();
     state.tunnels.insert(subdomain.clone(), conn);
     println!(
         "  {} tunnel registered: {}",
@@ -326,7 +327,7 @@ async fn handle_tunnel_ws(socket: WebSocket, state: Arc<RelayState>) {
 
     while let Some(Ok(msg)) = ws_stream.next().await {
         if let Message::Text(text) = msg {
-            dispatch_frame(&text, &pending).await;
+            dispatch_frame(&text, &conn_for_dispatch).await;
         }
     }
 
@@ -339,8 +340,10 @@ async fn handle_tunnel_ws(socket: WebSocket, state: Arc<RelayState>) {
 }
 
 /// Route an incoming WS text frame from the tunnel-client to the right
-/// per-request channel.
-async fn dispatch_frame(text: &str, pending: &PendingRequests) {
+/// per-request channel. If a chunk send fails because the public client
+/// has disconnected, send Cancel to the tunnel-client and clean up.
+async fn dispatch_frame(text: &str, conn: &Arc<TunnelConnection>) {
+    let pending = &conn.pending;
     let msg = match serde_json::from_str::<TunnelMessage>(text) {
         Ok(m) => m,
         Err(_) => return,
@@ -369,23 +372,34 @@ async fn dispatch_frame(text: &str, pending: &PendingRequests) {
             });
         }
         TunnelMessage::ResponseChunk { id, data, last } => {
-            let Some(slot) = pending.get(&id) else {
-                return;
+            // Take a clone of the Sender so we can drop the dashmap guard
+            // before awaiting send. Cloning here (locally) is fine because
+            // the clone lives only until this match arm returns; the only
+            // long-lived Sender stays in `pending` and is dropped by the
+            // terminator path below.
+            let tx_clone = {
+                let Some(slot) = pending.get(&id) else { return };
+                let InFlight::Streaming(tx) = slot.value() else {
+                    return;
+                };
+                tx.clone()
             };
-            let InFlight::Streaming(tx) = slot.value() else {
-                return;
-            };
+            let mut send_failed = false;
             if !data.is_empty()
                 && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&data)
+                && tx_clone.send(Ok(Bytes::from(bytes))).await.is_err()
             {
-                // If the receiver is gone (axum dropped the body), the
-                // send errors silently. The cancel watcher will detect
-                // that and clean up.
-                let _ = tx.send(Ok(Bytes::from(bytes))).await;
+                // Public client gone (axum dropped the body Receiver).
+                // Cancel the upstream stream and clean up.
+                send_failed = true;
             }
-            // Drop the slot guard so the remove() below can take it.
-            drop(slot);
-            if last {
+            drop(tx_clone);
+
+            if send_failed {
+                if pending.remove(&id).is_some() {
+                    send_cancel(conn, &id).await;
+                }
+            } else if last {
                 pending.remove(&id);
             }
         }
@@ -555,51 +569,15 @@ async fn handle_tunnel_request(
         }
     }
 
-    // Spawn a watcher: when the body's mpsc receiver is dropped (axum
-    // finished writing or the client disconnected), send Cancel and
-    // remove the pending entry. Without this, in-flight upstream
-    // streams would leak indefinitely on disconnect.
-    spawn_cancel_watcher(conn.clone(), req_id.clone());
+    // Cancellation is handled inside dispatch_frame's ResponseChunk arm:
+    // when a chunk send fails (axum dropped the body Receiver), we send
+    // Cancel and remove the pending entry. No separate watcher needed.
 
     let body_stream = tokio_stream::wrappers::ReceiverStream::new(head.body_rx);
     let body = axum::body::Body::from_stream(body_stream);
     builder.body(body).unwrap_or_else(|_| {
         (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
     })
-}
-
-/// Wait for the body sender held in `pending` to lose its matching
-/// receiver (axum dropped it). Then send `Cancel` to the tunnel-client
-/// and clear the pending entry. If the entry is removed by the chunk
-/// terminator first (clean end), this task exits quietly.
-fn spawn_cancel_watcher(conn: Arc<TunnelConnection>, id: String) {
-    tokio::spawn(async move {
-        // Grab the sender's `closed()` future. If the slot isn't
-        // Streaming yet (head still pending), wait until it is, then
-        // poll. Simplest implementation: poll with a short interval.
-        loop {
-            let slot = conn.pending.get(&id);
-            match slot.as_deref() {
-                Some(InFlight::Streaming(tx)) => {
-                    let tx = tx.clone();
-                    drop(slot);
-                    tx.closed().await;
-                    // Receiver dropped. If the entry is still there, it
-                    // means the stream didn't finish naturally, so the
-                    // upstream is still going. Cancel it.
-                    if conn.pending.remove(&id).is_some() {
-                        send_cancel(&conn, &id).await;
-                    }
-                    return;
-                }
-                Some(InFlight::AwaitingHead(_)) => {
-                    drop(slot);
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                None => return,
-            }
-        }
-    });
 }
 
 async fn send_cancel(conn: &TunnelConnection, id: &str) {
